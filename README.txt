@@ -1,48 +1,27 @@
-CONTEXTO CHAT - RENDER - VERSÃO COM STATUS
+Contexto Chat Render - versão sem comando / sem recarregar
 
-1) Suba a pasta no GitHub.
-2) No Render, crie Web Service.
-3) Build Command: npm install
-4) Start Command: npm start
+Esta versão corrige o problema de voltar para a tela inicial do Contexto.
 
-Variáveis no Render:
+O que mudou:
+- O Tampermonkey NÃO usa mais requestSubmit().
+- O Tampermonkey NÃO clica em botão genérico da página.
+- Envia a palavra só pelo campo de texto + tecla Enter.
+- Bloqueia submit nativo para evitar recarregar a página.
+
+Troca rápida:
+1. No Tampermonkey, apague o script antigo.
+2. Cole o arquivo: scripts/contexto-tampermonkey.user.js
+3. Troque RENDER_URL pelo link do seu Render, sem barra no final.
+4. Salve.
+5. Abra o Contexto e dê Ctrl+F5.
+
+Render:
+Não precisa recriar se o servidor já está recebendo chat. Só troque o Tampermonkey.
+
+Variáveis recomendadas no Render:
 TWITCH_CHANNEL=nomedocanal
 ACCEPT_ALL_MESSAGES=true
 IGNORE_COMMANDS=true
 MAX_WORD_LENGTH=35
 ALLOW_NUMBERS=false
 PANEL_PASSWORD=1234
-
-IMPORTANTE:
-- TWITCH_CHANNEL é sem @.
-- Tem que ser nome da Twitch, não link inteiro.
-- Depois do deploy, abra:
-  https://SEU-PROJETO.onrender.com/status.html
-
-COMO TESTAR:
-1) Abra /status.html no Render.
-2) Mande uma palavra no chat da Twitch do canal configurado.
-3) Veja se aparece em "Últimas mensagens brutas da Twitch".
-
-Se aparecer em "brutas", mas não em "aceitas":
-- O filtro rejeitou. Veja o motivo em "Rejeitadas".
-
-Se não aparecer nem em "brutas":
-- O Render não está lendo o canal.
-- Confira TWITCH_CHANNEL.
-- Confira se o serviço está ligado e sem erro nos Logs.
-- Se o canal for Kick, esse pacote não lê Kick, só Twitch.
-
-TAMPERMONKEY:
-No arquivo scripts/contexto-tampermonkey.user.js, troque:
-const RENDER_URL = 'COLE_AQUI_O_LINK_DO_RENDER';
-por:
-const RENDER_URL = 'https://SEU-PROJETO.onrender.com';
-
-Depois abra https://contexto.me/pt/ com Tampermonkey ligado.
-
-ATUALIZAÇÃO 1.2.0:
-- Corrige caso o Contexto fique em "calculando" e não adicione a palavra.
-- Usa setter nativo do input, eventos InputEvent, Enter, clique no botão e requestSubmit.
-- Aguarda o cálculo terminar antes de enviar a próxima palavra.
-- Ignora fila antiga ao abrir a aba para não travar com palavras acumuladas.

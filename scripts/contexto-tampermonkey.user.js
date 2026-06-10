@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Contexto Chat Nick no Quadrinho - envio corrigido
+// @name         Contexto Chat Nick no Quadrinho - sem recarregar
 // @namespace    https://chatgpt.com/
-// @version      1.2.0
-// @description  Recebe palavras do Render, envia no Contexto e injeta nick colorido na linha da palavra.
+// @version      1.3.0
+// @description  Recebe palavras do Render, envia no Contexto sem submit nativo e injeta nick colorido na linha da palavra.
 // @match        https://contexto.me/*
 // @match        https://*.contexto.me/*
 // @grant        none
@@ -197,27 +197,28 @@
     input.dispatchEvent(new Event('change', { bubbles: true }));
     await wait(120);
 
-    // 1) Enter realista
-    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
-    input.dispatchEvent(new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
-    input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
-    await wait(250);
+    // Envio seguro: NÃO usa requestSubmit e NÃO clica em botão genérico.
+    // No Contexto, submit nativo pode recarregar/voltar para a tela inicial.
+    input.dispatchEvent(new KeyboardEvent('keydown', {
+      key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
+      bubbles: true, cancelable: true, composed: true
+    }));
+    await wait(80);
+    input.dispatchEvent(new KeyboardEvent('keyup', {
+      key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
+      bubbles: true, cancelable: true, composed: true
+    }));
 
-    // 2) Botão de submit, se existir
-    const btn = findSubmitButton(input);
-    if (btn) {
-      btn.click();
-      await wait(250);
-    }
-
-    // 3) requestSubmit no form, se existir
+    // Se a página tiver form, bloqueia só o submit nativo causado por automação.
     const form = input.closest('form');
-    if (form) {
-      if (typeof form.requestSubmit === 'function') {
-        try { form.requestSubmit(btn || undefined); } catch { form.requestSubmit(); }
-      } else {
-        form.dispatchEvent(new SubmitEvent('submit', { bubbles: true, cancelable: true, submitter: btn || null }));
-      }
+    if (form && !form.dataset.ccNoReloadHook) {
+      form.dataset.ccNoReloadHook = '1';
+      form.addEventListener('submit', (e) => {
+        if (document.activeElement === input || input.value.trim()) {
+          e.preventDefault();
+          e.stopPropagation();
+        }
+      }, true);
     }
 
     return true;
@@ -232,21 +233,6 @@
       const rect = el.getBoundingClientRect();
       const visible = rect.width > 60 && rect.height > 10 && getComputedStyle(el).visibility !== 'hidden';
       return visible;
-    });
-  }
-
-  function findSubmitButton(input) {
-    const form = input.closest('form');
-    const candidates = [
-      ...(form ? [...form.querySelectorAll('button, input[type="submit"]')] : []),
-      ...[...document.querySelectorAll('button, input[type="submit"]')]
-    ];
-    return candidates.find(btn => {
-      if (btn.disabled) return false;
-      const rect = btn.getBoundingClientRect();
-      if (rect.width < 10 || rect.height < 10) return false;
-      const text = normalize(btn.textContent || btn.value || btn.getAttribute('aria-label') || '');
-      return text.includes('enviar') || text.includes('send') || text.includes('ok') || btn.type === 'submit' || btn.tagName === 'BUTTON';
     });
   }
 
