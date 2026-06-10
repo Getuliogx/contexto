@@ -13,7 +13,7 @@
 
   // TROQUE PELO LINK DO SEU RENDER, SEM BARRA NO FINAL.
   // Exemplo: const RENDER_URL = 'https://contexto-chat-render.onrender.com';
-  const RENDER_URL = 'COLE_AQUI_O_LINK_DO_RENDER';
+  const RENDER_URL = 'https://contexto-o77j.onrender.com';
 
   const AUTO_SEND_TO_GAME = true;
   const SEND_DELAY_MS = 900;
