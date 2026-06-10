@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Enviar palavra para Contexto</title>
+  <style>
+    body { font-family: Arial, sans-serif; background:#101014; color:white; max-width:720px; margin:30px auto; padding:0 16px; }
+    input, button { font-size:18px; padding:12px; border-radius:8px; border:0; margin:6px 0; box-sizing:border-box; }
+    input { width:100%; background:#1b1b22; color:white; border:1px solid #333; }
+    button { cursor:pointer; background:#00d5ff; color:#001018; font-weight:bold; width:100%; }
+    .row { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+    #log { margin-top:20px; background:#1b1b22; border:1px solid #333; border-radius:8px; padding:12px; min-height:80px; }
+  </style>
+</head>
+<body>
+  <h1>Enviar palavra para o Contexto</h1>
+  <p>Use isso para testar antes de ligar no chat.</p>
+  <form id="form">
+    <input id="password" placeholder="Senha do painel" type="password" />
+    <div class="row">
+      <input id="nick" placeholder="Nick" value="Getulio" />
+      <input id="color" placeholder="Cor do nick" value="#00ff99" />
+    </div>
+    <input id="word" placeholder="Palavra" autofocus />
+    <button>Enviar</button>
+  </form>
+  <div id="log">Aguardando...</div>
+<script>
+const form = document.getElementById('form');
+const log = document.getElementById('log');
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const body = {
+    password: password.value,
+    nick: nick.value,
+    color: color.value,
+    word: word.value
+  };
+  const r = await fetch('/api/submit', {
+    method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body)
+  });
+  const data = await r.json().catch(() => ({}));
+  log.textContent = r.ok ? `Enviado: ${body.nick} -> ${body.word}` : `Erro: ${data.error || r.status}`;
+  if (r.ok) word.value = '';
+});
+</script>
+</body>
+</html>

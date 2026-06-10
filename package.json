@@ -1,0 +1,19 @@
+{
+  "name": "contexto-chat-render",
+  "version": "1.0.0",
+  "description": "Integra chat/site com Contexto usando Render + Tampermonkey",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.3",
+    "ws": "^8.16.0",
+    "tmi.js": "^1.8.5",
+    "cors": "^2.8.5"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

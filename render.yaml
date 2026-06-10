@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: contexto-chat-render
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: TWITCH_CHANNEL
+        value: nomedocanal
+      - key: ACCEPT_ALL_MESSAGES
+        value: "false"
+      - key: COMMAND_PREFIX
+        value: "!c"
+      - key: PANEL_PASSWORD
+        value: "1234"
