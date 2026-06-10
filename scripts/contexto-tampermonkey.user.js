@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Contexto Chat Render - Nick no quadrinho
 // @namespace    contexto-chat-render
-// @version      1.6.0
-// @description  Recebe nick/palavra/cor do Render e coloca o nick dentro do quadrinho correto do Contexto, sem jogar nada para o canto.
+// @version      1.7.0
+// @description  Recebe nick/palavra/cor do Render e mantém o nick dentro de todos os quadrinhos da palavra no Contexto.
 // @match        https://contexto.me/*
 // @match        https://www.contexto.me/*
 // @grant        GM_xmlhttpRequest
@@ -27,8 +27,9 @@
   let receivedCount = 0;
   let sentCount = 0;
 
-  // palavra normalizada -> dados do nick
-  const pendingByWord = new Map();
+  // Histórico persistente: cada palavra enviada mantém nick/cor para reinserir depois que o Contexto rerenderizar a lista.
+  const historyKey = 'contextoChatNickHistory_v17';
+  let nickHistory = loadNickHistory();
 
   function baseUrl() { return String(RENDER_URL || '').replace(/\/$/, ''); }
   function log(...args) { if (DEBUG) console.log('[Contexto Chat]', ...args); }
@@ -180,10 +181,12 @@
     await sleep(250);
     fireEnter(input);
 
-    pendingByWord.set(normalizeWord(word), {
+    addNickHistory({
+      id: item.id || String(Date.now()),
       nick: item.nick || 'chat',
       color: item.color || '#ffffff',
       word,
+      norm: normalizeWord(word),
       time: Date.now()
     });
     sentCount++;
@@ -308,20 +311,123 @@
     return true;
   }
 
-  function injectNicks() {
-    const now = Date.now();
-    for (const [norm, info] of Array.from(pendingByWord.entries())) {
-      if (now - info.time > 10 * 60 * 1000) {
-        pendingByWord.delete(norm);
-        continue;
-      }
-      const row = findBestRow(info.word);
-      if (!row) continue;
-      if (insertNickInsideRow(row, info)) {
-        pendingByWord.delete(norm);
-        log('nick inserido dentro do quadrinho:', info.nick, info.word);
-      }
+  function loadNickHistory() {
+    try {
+      const arr = JSON.parse(localStorage.getItem(historyKey) || '[]');
+      return Array.isArray(arr) ? arr.filter(x => x && x.word && x.nick).slice(-250) : [];
+    } catch (_) {
+      return [];
     }
+  }
+
+  function saveNickHistory() {
+    try { localStorage.setItem(historyKey, JSON.stringify(nickHistory.slice(-250))); } catch (_) {}
+  }
+
+  function addNickHistory(info) {
+    if (!info || !info.word || !info.nick) return;
+    // Evita repetir a mesma mensagem recebida duas vezes pelo WebSocket + polling.
+    if (info.id && nickHistory.some(x => x.id === info.id)) return;
+    nickHistory.push(info);
+    if (nickHistory.length > 250) nickHistory = nickHistory.slice(-250);
+    saveNickHistory();
+  }
+
+  function findAllRowsForWord(word) {
+    const wordNorm = normalizeWord(word);
+    if (!wordNorm) return [];
+    const all = Array.from(document.querySelectorAll('div, li, tr, a, button'));
+    const candidates = all.filter(el => looksLikeRankRow(el, wordNorm));
+    if (!candidates.length) return [];
+
+    // Remove pais quando também existe um filho candidato. Assim não mexe no container inteiro.
+    const deepest = candidates.filter(el => !candidates.some(other => other !== el && el.contains(other)));
+
+    // Ordena pela posição visual. O Contexto costuma mostrar o chute atual destacado primeiro.
+    deepest.sort((a, b) => {
+      const ar = a.getBoundingClientRect();
+      const br = b.getBoundingClientRect();
+      if (Math.abs(ar.top - br.top) > 2) return ar.top - br.top;
+      return ar.left - br.left;
+    });
+    return deepest;
+  }
+
+  function clearWrongFloatingNicks() {
+    // Remove nicks que versões antigas possam ter deixado fora dos quadrinhos.
+    for (const nick of Array.from(document.querySelectorAll('.ctx-chat-nick'))) {
+      const row = nick.closest('div, li, tr, a, button');
+      if (!row || !/\d{1,6}\s*$/.test(elementText(row))) nick.remove();
+    }
+  }
+
+  function insertOrUpdateNickInsideRow(row, info, slot) {
+    if (!row || !info) return false;
+
+    let nick = row.querySelector(`.ctx-chat-nick[data-ctx-slot="${slot}"]`);
+    if (!nick) {
+      // Se já existe um nick antigo sem slot nessa linha, reutiliza para não duplicar.
+      nick = row.querySelector('.ctx-chat-nick:not([data-ctx-slot])') || document.createElement('span');
+      nick.className = 'ctx-chat-nick';
+      nick.dataset.ctxSlot = String(slot);
+    }
+
+    nick.textContent = info.nick;
+    nick.title = `${info.nick} mandou: ${info.word}`;
+    nick.style.cssText = [
+      'color:' + (info.color || '#fff'),
+      'font-weight:700',
+      'font-size:.88em',
+      'line-height:1',
+      'white-space:nowrap',
+      'text-shadow:0 1px 2px rgba(0,0,0,.75)',
+      'display:inline-block',
+      'vertical-align:middle',
+      'max-width:120px',
+      'overflow:hidden',
+      'text-overflow:ellipsis',
+      'margin-left:8px',
+      'margin-right:8px'
+    ].join(';');
+
+    const rankEl = findRankElement(row);
+    if (rankEl && rankEl.parentElement) {
+      if (nick.parentElement !== rankEl.parentElement || nick.nextSibling !== rankEl) {
+        rankEl.parentElement.insertBefore(nick, rankEl);
+      }
+      return true;
+    }
+
+    if (nick.parentElement !== row) row.appendChild(nick);
+    return true;
+  }
+
+  function injectNicks() {
+    clearWrongFloatingNicks();
+
+    const now = Date.now();
+    // Mantém histórico por um bom tempo, porque o Contexto recria as linhas e apaga alterações antigas.
+    nickHistory = nickHistory.filter(x => now - (x.time || 0) < 6 * 60 * 60 * 1000);
+
+    const groups = new Map();
+    for (const info of nickHistory) {
+      const norm = info.norm || normalizeWord(info.word);
+      if (!norm) continue;
+      if (!groups.has(norm)) groups.set(norm, []);
+      groups.get(norm).push(info);
+    }
+
+    for (const infos of groups.values()) {
+      // Mais recentes primeiro, porque a linha destacada/nova costuma aparecer acima.
+      infos.sort((a, b) => (b.time || 0) - (a.time || 0));
+      const rows = findAllRowsForWord(infos[0].word);
+      rows.forEach((row, idx) => {
+        const info = infos[idx] || infos[0];
+        insertOrUpdateNickInsideRow(row, info, idx);
+      });
+    }
+
+    saveNickHistory();
   }
 
   // Bloqueia submit real que causava volta para a tela inicial, mas não cria painel nem mexe no layout.
