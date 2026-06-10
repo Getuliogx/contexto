@@ -40,3 +40,9 @@ por:
 const RENDER_URL = 'https://SEU-PROJETO.onrender.com';
 
 Depois abra https://contexto.me/pt/ com Tampermonkey ligado.
+
+ATUALIZAÇÃO 1.2.0:
+- Corrige caso o Contexto fique em "calculando" e não adicione a palavra.
+- Usa setter nativo do input, eventos InputEvent, Enter, clique no botão e requestSubmit.
+- Aguarda o cálculo terminar antes de enviar a próxima palavra.
+- Ignora fila antiga ao abrir a aba para não travar com palavras acumuladas.
