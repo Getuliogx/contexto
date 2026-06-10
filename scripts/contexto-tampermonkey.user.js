@@ -1,290 +1,275 @@
 // ==UserScript==
-// @name         Contexto Chat Nick no Quadrinho - sem recarregar
-// @namespace    https://chatgpt.com/
-// @version      1.3.0
-// @description  Recebe palavras do Render, envia no Contexto sem submit nativo e injeta nick colorido na linha da palavra.
+// @name         Contexto Chat Render - Fila Corrigida
+// @namespace    contexto-chat-render
+// @version      1.5.0
+// @description  Recebe nick/palavra/cor do Render e injeta no Contexto. Usa WebSocket + polling fallback.
 // @match        https://contexto.me/*
-// @match        https://*.contexto.me/*
-// @grant        none
+// @match        https://www.contexto.me/*
+// @grant        GM_xmlhttpRequest
+// @connect      *
 // ==/UserScript==
 
 (function () {
   'use strict';
 
-  // TROQUE PELO LINK DO SEU RENDER, SEM BARRA NO FINAL.
-  // Exemplo: const RENDER_URL = 'https://contexto-chat-render.onrender.com';
+  // TROQUE PELO SEU LINK DO RENDER, SEM BARRA NO FINAL
   const RENDER_URL = 'COLE_AQUI_O_LINK_DO_RENDER';
 
-  const AUTO_SEND_TO_GAME = true;
+  const POLL_MS = 1200;
+  const SEND_DELAY_MS = 900;
+  const MAX_QUEUE = 30;
+  const DEBUG = true;
 
-  // Mais lento para o Contexto terminar o "calculando" antes da próxima palavra.
-  const DELAY_AFTER_SEND_MS = 3200;
-  const MAX_WAIT_CALCULATING_MS = 12000;
-  const IGNORE_OLD_QUEUE_ON_OPEN = true; // evita jogar palavras antigas quando abre/recarrega a aba
+  let lastId = localStorage.getItem('contextoChatLastId_v15') || '';
+  let queue = [];
+  let sending = false;
+  let ws = null;
+  let wsConnected = false;
+  let receivedCount = 0;
+  let sentCount = 0;
+  const pendingByWord = new Map();
 
-  if (!RENDER_URL || RENDER_URL.includes('COLE_AQUI')) {
-    console.warn('[Contexto Chat] Edite RENDER_URL no script Tampermonkey.');
-    return;
-  }
+  function baseUrl() { return String(RENDER_URL || '').replace(/\/$/, ''); }
+  function log(...args) { if (DEBUG) console.log('[Contexto Chat]', ...args); }
+  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-  const guessByWord = new Map();
-  const queue = [];
-  const sentWords = new Set();
-  let busy = false;
-  let connectedOnce = false;
-
-  const style = document.createElement('style');
-  style.textContent = `
-    .cc-nick-badge{
-      display:inline-flex!important;
-      align-items:center!important;
-      margin-left:auto!important;
-      margin-right:10px!important;
-      font-weight:800!important;
-      font-size:0.92em!important;
-      text-shadow:0 1px 2px rgba(0,0,0,.35)!important;
-      max-width:150px!important;
-      overflow:hidden!important;
-      text-overflow:ellipsis!important;
-      white-space:nowrap!important;
-      flex:0 0 auto!important;
+  function panel(text) {
+    let el = document.getElementById('ctx-chat-panel');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'ctx-chat-panel';
+      el.style.cssText = `
+        position: fixed; right: 12px; bottom: 12px; z-index: 999999;
+        background: rgba(0,0,0,.78); color: #fff; padding: 8px 10px;
+        border-radius: 6px; font: 12px Arial, sans-serif; max-width: 360px;
+        line-height: 1.35; pointer-events: none;
+      `;
+      document.body.appendChild(el);
     }
-    .cc-row-marked{
-      display:flex!important;
-      align-items:center!important;
-      gap:8px!important;
-    }
-    #cc-status-mini{
-      position:fixed!important;
-      right:10px!important;
-      bottom:10px!important;
-      z-index:999999!important;
-      background:rgba(0,0,0,.75)!important;
-      color:#fff!important;
-      padding:6px 9px!important;
-      border-radius:8px!important;
-      font:12px Arial,sans-serif!important;
-      pointer-events:none!important;
-    }
-  `;
-  document.documentElement.appendChild(style);
-
-  const mini = document.createElement('div');
-  mini.id = 'cc-status-mini';
-  mini.textContent = 'Contexto Chat: iniciando...';
-  document.documentElement.appendChild(mini);
-
-  function setMini(text) {
-    mini.textContent = 'Contexto Chat: ' + text;
-    console.log('[Contexto Chat]', text);
+    el.innerHTML = text;
   }
 
-  function wsUrl() {
-    return RENDER_URL.replace(/^http/, 'ws');
+  function updatePanel(extra='') {
+    const renderOk = baseUrl() && !baseUrl().includes('COLE_AQUI');
+    panel(
+      `<b>Contexto Chat</b><br>` +
+      `Render: ${renderOk ? 'configurado' : 'faltando link'}<br>` +
+      `Conexão: ${wsConnected ? 'WebSocket OK' : 'polling'}<br>` +
+      `Recebidas: ${receivedCount} | Enviadas: ${sentCount} | Fila: ${queue.length}` +
+      (extra ? `<br>${extra}` : '')
+    );
   }
 
-  function normalize(s) {
-    return String(s || '').trim().toLowerCase();
-  }
-
-  function connect() {
-    const ws = new WebSocket(wsUrl());
-    ws.onopen = () => {
-      setMini('conectado no Render');
-      connectedOnce = true;
-    };
-    ws.onmessage = (ev) => {
-      let data;
-      try { data = JSON.parse(ev.data); } catch { return; }
-
-      // Não joga fila antiga ao abrir a aba, só guarda nick/cor para injetar se a linha já existir.
-      if (data.type === 'hello' && Array.isArray(data.recent)) {
-        data.recent.forEach(g => {
-          if (g && g.word) guessByWord.set(normalize(g.word), g);
+  function httpGet(url) {
+    return new Promise((resolve, reject) => {
+      if (typeof GM_xmlhttpRequest === 'function') {
+        GM_xmlhttpRequest({
+          method: 'GET', url, timeout: 10000,
+          onload: r => {
+            try { resolve(JSON.parse(r.responseText)); } catch (e) { reject(e); }
+          },
+          onerror: reject,
+          ontimeout: reject
         });
-        if (!IGNORE_OLD_QUEUE_ON_OPEN) data.recent.forEach(receiveGuess);
-        return;
+      } else {
+        fetch(url, { cache: 'no-store' }).then(r => r.json()).then(resolve).catch(reject);
       }
-
-      if (data.type !== 'guess') return;
-      receiveGuess(data);
-    };
-    ws.onclose = () => {
-      setMini('desconectado, reconectando...');
-      setTimeout(connect, 2500);
-    };
-    ws.onerror = () => { try { ws.close(); } catch {} };
+    });
   }
 
-  function receiveGuess(data) {
-    const word = normalize(data.word);
-    if (!word) return;
-    guessByWord.set(word, data);
-    if (!sentWords.has(word)) queue.push(data);
-    processQueue();
+  function normalizeWord(s) {
+    return String(s || '').trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
   }
 
-  async function processQueue() {
-    if (busy) return;
-    busy = true;
-    while (queue.length) {
-      const guess = queue.shift();
-      const word = normalize(guess.word);
-      if (!word || sentWords.has(word)) continue;
+  function enqueue(item, origin) {
+    if (!item || item.type && item.type !== 'guess') return;
+    if (!item.id || !item.word) return;
+    if (item.id === lastId) return;
+    if (queue.some(x => x.id === item.id)) return;
 
-      await waitUntilNotCalculating();
-      const before = document.body.innerText;
-      let ok = true;
-      if (AUTO_SEND_TO_GAME) ok = await sendWordToContexto(guess.word);
-      sentWords.add(word);
+    lastId = item.id;
+    localStorage.setItem('contextoChatLastId_v15', lastId);
+    queue.push(item);
+    if (queue.length > MAX_QUEUE) queue = queue.slice(-MAX_QUEUE);
+    receivedCount++;
+    log('recebido via', origin, item);
+    updatePanel(`Última: <b>${escapeHtml(item.word)}</b> — ${escapeHtml(item.nick || '')}`);
+  }
 
-      setMini(ok ? `enviou: ${guess.word}` : `falhou ao enviar: ${guess.word}`);
-      await waitForWordToAppear(word, before);
-      injectNickForWord(word);
-      await wait(DELAY_AFTER_SEND_MS);
+  function escapeHtml(s) {
+    return String(s || '').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+  }
+
+  function startWebSocket() {
+    if (!baseUrl() || baseUrl().includes('COLE_AQUI')) {
+      updatePanel('Erro: coloque o link do Render no script.');
+      return;
     }
-    busy = false;
-  }
-
-  function wait(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-  function isCalculating() {
-    const text = normalize(document.body.innerText);
-    return text.includes('calculando') || text.includes('calculating');
-  }
-
-  async function waitUntilNotCalculating() {
-    const start = Date.now();
-    while (isCalculating() && Date.now() - start < MAX_WAIT_CALCULATING_MS) {
-      setMini('aguardando cálculo terminar...');
-      await wait(350);
+    try {
+      const wsUrl = baseUrl().replace(/^https:/i, 'wss:').replace(/^http:/i, 'ws:');
+      ws = new WebSocket(wsUrl);
+      ws.onopen = () => { wsConnected = true; updatePanel(); log('websocket conectado'); };
+      ws.onclose = () => { wsConnected = false; updatePanel('WebSocket caiu, usando polling.'); setTimeout(startWebSocket, 3000); };
+      ws.onerror = () => { wsConnected = false; updatePanel('WebSocket erro, usando polling.'); };
+      ws.onmessage = (ev) => {
+        try {
+          const data = JSON.parse(ev.data);
+          if (data.type === 'hello') {
+            // Não joga fila antiga quando abre a aba. Só marca a última como vista.
+            const recent = Array.isArray(data.recent) ? data.recent : [];
+            if (!lastId && recent.length) {
+              lastId = recent[recent.length - 1].id;
+              localStorage.setItem('contextoChatLastId_v15', lastId);
+            }
+            return;
+          }
+          enqueue(data, 'websocket');
+        } catch (e) { log('ws json erro', e); }
+      };
+    } catch (e) {
+      log('ws falhou', e);
+      updatePanel('WebSocket falhou, usando polling.');
     }
   }
 
-  async function waitForWordToAppear(word, beforeText) {
-    const start = Date.now();
-    const target = normalize(word);
-    while (Date.now() - start < MAX_WAIT_CALCULATING_MS) {
-      const row = findRowForWord(target);
-      if (row) return true;
-      if (!isCalculating() && normalize(document.body.innerText).includes(target)) return true;
-      await wait(400);
+  async function poll() {
+    if (!baseUrl() || baseUrl().includes('COLE_AQUI')) return;
+    try {
+      const data = await httpGet(`${baseUrl()}/api/queue?after=${encodeURIComponent(lastId || '')}&t=${Date.now()}`);
+      const items = Array.isArray(data.items) ? data.items : [];
+      if (!lastId && data.latestId) {
+        lastId = data.latestId;
+        localStorage.setItem('contextoChatLastId_v15', lastId);
+      }
+      for (const item of items) enqueue(item, 'polling');
+    } catch (e) {
+      log('poll falhou', e && e.message ? e.message : e);
+      updatePanel('Polling falhou. Veja se o Render está online e se /api/queue existe.');
     }
-    return false;
+  }
+
+  function getInput() {
+    const inputs = Array.from(document.querySelectorAll('input, textarea')).filter(el => {
+      const r = el.getBoundingClientRect();
+      const st = getComputedStyle(el);
+      return r.width > 100 && r.height > 20 && st.display !== 'none' && st.visibility !== 'hidden' && !el.disabled && !el.readOnly;
+    });
+    return inputs.find(el => /text|search|^$/.test(el.type || '')) || inputs[0] || null;
   }
 
   function setNativeValue(el, value) {
     const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-    const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
-    descriptor.set.call(el, value);
+    const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+    if (desc && desc.set) desc.set.call(el, value);
+    else el.value = value;
   }
 
-  async function sendWordToContexto(word) {
-    const input = findInput();
-    if (!input) {
-      setMini('campo não encontrado');
-      return false;
-    }
+  function fireInputEvents(el, value) {
+    el.focus();
+    setNativeValue(el, '');
+    el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'deleteContentBackward', data: null }));
+    setNativeValue(el, value);
+    el.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, cancelable: true, inputType: 'insertText', data: value }));
+    el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertText', data: value }));
+    el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+  }
 
-    input.focus();
-    input.click();
-    setNativeValue(input, '');
-    input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward', data: null }));
-    await wait(80);
+  function fireEnter(el) {
+    const opts = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true, composed: true };
+    el.dispatchEvent(new KeyboardEvent('keydown', opts));
+    el.dispatchEvent(new KeyboardEvent('keypress', opts));
+    el.dispatchEvent(new KeyboardEvent('keyup', opts));
+  }
 
-    setNativeValue(input, word);
-    input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: word }));
-    input.dispatchEvent(new Event('change', { bubbles: true }));
-    await wait(120);
-
-    // Envio seguro: NÃO usa requestSubmit e NÃO clica em botão genérico.
-    // No Contexto, submit nativo pode recarregar/voltar para a tela inicial.
-    input.dispatchEvent(new KeyboardEvent('keydown', {
-      key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
-      bubbles: true, cancelable: true, composed: true
-    }));
-    await wait(80);
-    input.dispatchEvent(new KeyboardEvent('keyup', {
-      key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
-      bubbles: true, cancelable: true, composed: true
-    }));
-
-    // Se a página tiver form, bloqueia só o submit nativo causado por automação.
-    const form = input.closest('form');
-    if (form && !form.dataset.ccNoReloadHook) {
-      form.dataset.ccNoReloadHook = '1';
-      form.addEventListener('submit', (e) => {
-        if (document.activeElement === input || input.value.trim()) {
-          e.preventDefault();
-          e.stopPropagation();
-        }
-      }, true);
-    }
-
+  function fireSafeSubmit(el) {
+    const form = el.closest('form');
+    if (!form) return false;
+    let ev;
+    try { ev = new SubmitEvent('submit', { bubbles: true, cancelable: true, submitter: null }); }
+    catch (_) { ev = new Event('submit', { bubbles: true, cancelable: true }); }
+    form.dispatchEvent(ev);
+    ev.preventDefault();
     return true;
   }
 
-  function findInput() {
-    const all = [...document.querySelectorAll('input, textarea')];
-    return all.find(el => {
-      const type = (el.getAttribute('type') || 'text').toLowerCase();
-      if (type !== 'text' && type !== 'search' && el.tagName !== 'TEXTAREA') return false;
-      if (el.disabled || el.readOnly) return false;
-      const rect = el.getBoundingClientRect();
-      const visible = rect.width > 60 && rect.height > 10 && getComputedStyle(el).visibility !== 'hidden';
-      return visible;
+  async function sendToContexto(item) {
+    const word = String(item.word || '').trim();
+    if (!word) return false;
+    const input = getInput();
+    if (!input) { updatePanel('Não achei o campo do Contexto.'); return false; }
+
+    fireInputEvents(input, word);
+    await sleep(120);
+    fireEnter(input);
+    await sleep(220);
+    fireSafeSubmit(input);
+    await sleep(220);
+    fireEnter(input);
+
+    pendingByWord.set(normalizeWord(word), {
+      nick: item.nick || 'chat',
+      color: item.color || '#ffffff',
+      word,
+      time: Date.now()
+    });
+    sentCount++;
+    updatePanel(`Enviado: <b>${escapeHtml(word)}</b> — ${escapeHtml(item.nick || '')}`);
+    return true;
+  }
+
+  async function processQueue() {
+    if (sending || !queue.length) return;
+    sending = true;
+    try {
+      const item = queue.shift();
+      await sendToContexto(item);
+      await sleep(SEND_DELAY_MS);
+      injectNicks();
+    } catch (e) { console.error('[Contexto Chat] erro', e); }
+    finally { sending = false; updatePanel(); }
+  }
+
+  function findRows() {
+    return Array.from(document.querySelectorAll('div, li, tr, p')).filter(el => {
+      const txt = (el.innerText || '').trim();
+      const r = el.getBoundingClientRect();
+      return txt && txt.length < 220 && /\d/.test(txt) && r.width > 120 && r.height >= 20;
     });
   }
 
-  function findRowForWord(word) {
-    const target = normalize(word);
-    const nodes = [...document.querySelectorAll('body *')].filter(el => {
-      if (el.id === 'cc-status-mini') return false;
-      if (el.children.length > 8) return false;
-      const t = normalize(el.textContent);
-      return t === target || t.startsWith(target + ' ') || t.includes('\n' + target) || t.includes(target + '\n');
-    });
+  function injectNicks() {
+    const rows = findRows();
+    const now = Date.now();
+    for (const [norm, info] of pendingByWord) {
+      if (now - info.time > 10 * 60 * 1000) { pendingByWord.delete(norm); continue; }
+      const row = rows.find(el => normalizeWord(el.innerText).includes(norm));
+      if (!row || row.querySelector('.ctx-chat-nick')) continue;
 
-    for (const el of nodes) {
-      let row = el;
-      for (let i = 0; i < 6 && row && row !== document.body; i++, row = row.parentElement) {
-        const txt = normalize(row.textContent);
-        const hasWord = txt.includes(target);
-        const hasNumber = /\b\d{1,6}\b/.test(txt);
-        const rect = row.getBoundingClientRect();
-        if (hasWord && hasNumber && rect.width > 120 && rect.height > 14) return row;
-      }
+      row.style.display = row.style.display || 'flex';
+      row.style.alignItems = row.style.alignItems || 'center';
+      row.style.gap = row.style.gap || '8px';
+
+      const nick = document.createElement('span');
+      nick.className = 'ctx-chat-nick';
+      nick.textContent = info.nick;
+      nick.style.cssText = `margin-left:auto;margin-right:8px;font-weight:700;color:${info.color};text-shadow:0 1px 2px rgba(0,0,0,.8);font-size:.9em;white-space:nowrap;`;
+      const children = Array.from(row.children);
+      const last = children[children.length - 1];
+      if (last) row.insertBefore(nick, last); else row.appendChild(nick);
     }
-    return null;
   }
 
-  function injectNickForWord(word) {
-    const data = guessByWord.get(normalize(word));
-    if (!data) return;
-
-    const row = findRowForWord(word);
-    if (!row) return;
-
-    row.classList.add('cc-row-marked');
-    let badge = row.querySelector('.cc-nick-badge');
-    if (!badge) {
-      badge = document.createElement('span');
-      badge.className = 'cc-nick-badge';
-
-      const children = [...row.children];
-      const numberChild = children.reverse().find(ch => /^\s*#?\d{1,6}\s*$/.test(ch.textContent || ''));
-      if (numberChild) row.insertBefore(badge, numberChild);
-      else row.appendChild(badge);
+  document.addEventListener('submit', function (e) {
+    if (e.isTrusted) {
+      // bloqueia submit real para não voltar para tela inicial
+      e.preventDefault();
+      e.stopPropagation();
+      log('submit real bloqueado');
     }
-    badge.textContent = data.nick || data.username || 'chat';
-    badge.style.color = data.color || '#00d5ff';
-    row.scrollIntoView({ behavior: 'smooth', block: 'center' });
-  }
+  }, true);
 
-  const mo = new MutationObserver(() => {
-    for (const [word] of guessByWord) injectNickForWord(word);
-  });
-  mo.observe(document.body, { childList: true, subtree: true, characterData: true });
-
-  connect();
+  updatePanel('Iniciando...');
+  startWebSocket();
+  setInterval(async () => { await poll(); await processQueue(); injectNicks(); }, POLL_MS);
+  setInterval(injectNicks, 1500);
 })();

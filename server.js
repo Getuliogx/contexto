@@ -128,6 +128,27 @@ app.get('/api/status', (req, res) => {
   res.json({ ok: true, status, config: { mode: ACCEPT_ALL_MESSAGES ? 'sem_comando' : 'com_prefixo', prefix: COMMAND_PREFIX, maxWordLength: MAX_WORD_LENGTH, ignoreCommands: IGNORE_COMMANDS, allowNumbers: ALLOW_NUMBERS }, recent, rawMessages, rejected });
 });
 
+
+app.get('/api/queue', (req, res) => {
+  const after = String(req.query.after || '').trim();
+  const latestId = recent.length ? recent[recent.length - 1].id : '';
+
+  // Primeira conexão: não manda fila antiga para não jogar palavras velhas.
+  if (!after) {
+    return res.json({ ok: true, latestId, items: [] });
+  }
+
+  let idx = recent.findIndex(x => x.id === after);
+  let items;
+  if (idx >= 0) {
+    items = recent.slice(idx + 1);
+  } else {
+    // Se o ID antigo sumiu da memória do Render, manda só as últimas para não travar.
+    items = recent.slice(-10);
+  }
+  res.json({ ok: true, latestId, items });
+});
+
 app.post('/api/submit', (req, res) => {
   if (PANEL_PASSWORD && req.body.password !== PANEL_PASSWORD) {
     return res.status(401).json({ ok: false, error: 'Senha errada' });

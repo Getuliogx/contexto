@@ -1,0 +1,26 @@
+CORREÇÃO: mensagens não chegavam no site
+
+Esta versão adiciona o endpoint /api/queue no servidor do Render e troca o Tampermonkey por uma versão com:
+- WebSocket
+- fallback por polling a cada 1,2s
+- painel de debug no canto inferior direito
+
+IMPORTANTE:
+Você precisa atualizar os arquivos no GitHub/Render, não só o Tampermonkey.
+Se o Render estiver com o server.js antigo, o script novo não acha /api/queue.
+
+Passos:
+1) Substitua os arquivos do GitHub por estes arquivos.
+2) Faça redeploy no Render.
+3) Abra https://SEU-PROJETO.onrender.com/status.html e veja se mensagens do chat aparecem.
+4) Troque o script no Violentmonkey/Tampermonkey.
+5) No script, troque COLE_AQUI_O_LINK_DO_RENDER pelo link do Render.
+6) Abra o Contexto e aperte Ctrl+F5.
+
+Variáveis no Render:
+TWITCH_CHANNEL=nomedocanal
+ACCEPT_ALL_MESSAGES=true
+IGNORE_COMMANDS=true
+MAX_WORD_LENGTH=35
+ALLOW_NUMBERS=false
+PANEL_PASSWORD=1234
