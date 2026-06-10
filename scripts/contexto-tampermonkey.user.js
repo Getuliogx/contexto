@@ -1,48 +1,105 @@
 // ==UserScript==
-// @name         Contexto Chat Render - Nick no quadrinho
+// @name         Contexto Chat Render - FINAL corrigido
 // @namespace    contexto-chat-render
-// @version      1.9.0
-// @description  Recebe nick/palavra/cor do Render e mantém 1 nick dentro de cada quadrinho da palavra no Contexto, sem duplicar e recupera recentes do Render.
+// @version      5.0.0
+// @description  Recebe palavras do chat pelo Render, envia para o Contexto e coloca o nick colorido dentro do quadrinho certo.
 // @match        https://contexto.me/*
 // @match        https://www.contexto.me/*
 // @grant        GM_xmlhttpRequest
 // @connect      *
+// @run-at       document-idle
 // ==/UserScript==
 
 (function () {
   'use strict';
 
-  // TROQUE PELO SEU LINK DO RENDER, SEM BARRA NO FINAL
-  const RENDER_URL = 'https://contexto-o77j.onrender.com';
+  // COLE O LINK DO RENDER AQUI, SEM BARRA NO FINAL
+  const RENDER_URL = 'COLE_AQUI_O_LINK_DO_RENDER';
 
-  const POLL_MS = 1200;
-  const SEND_DELAY_MS = 900;
-  const MAX_QUEUE = 30;
+  const POLL_MS = 900;
+  const BETWEEN_WORDS_MS = 1500;
+  const WAIT_RESULT_MS = 6500;
+  const STORAGE_LAST_ID = 'ctxChat_final_lastId_v50';
+  const STORAGE_HISTORY = 'ctxChat_final_history_v50';
+  const STORAGE_FAILSAFE_LAST_ID = 'ctxChat_lastId_v20'; // aproveita última versão que recebia certo
   const DEBUG = true;
 
-  let lastId = localStorage.getItem('contextoChatLastId_v16') || '';
+  let lastId = localStorage.getItem(STORAGE_LAST_ID) || localStorage.getItem(STORAGE_FAILSAFE_LAST_ID) || '';
   let queue = [];
   let sending = false;
   let ws = null;
-  let receivedCount = 0;
-  let sentCount = 0;
 
-  // Histórico persistente: cada palavra enviada mantém nick/cor para reinserir depois que o Contexto rerenderizar a lista.
-  const historyKey = 'contextoChatNickHistory_v17';
-  let nickHistory = loadNickHistory();
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const log = (...a) => DEBUG && console.log('[Contexto Chat FINAL]', ...a);
+  const baseUrl = () => String(RENDER_URL || '').trim().replace(/\/+$/, '');
 
-  function baseUrl() { return String(RENDER_URL || '').replace(/\/$/, ''); }
-  function log(...args) { if (DEBUG) console.log('[Contexto Chat]', ...args); }
-  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+  function normalize(s) {
+    return String(s || '')
+      .trim()
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^\p{L}0-9'’.-]/gu, '');
+  }
+
+  function safeColor(c) {
+    return /^#[0-9a-f]{6}$/i.test(String(c || '')) ? c : '#ffd400';
+  }
+
+  function loadHistory() {
+    try { return JSON.parse(localStorage.getItem(STORAGE_HISTORY) || '{}') || {}; }
+    catch (_) { return {}; }
+  }
+
+  function saveHistory(h) {
+    // h = { palavraNormalizada: [metas...] }
+    const all = [];
+    for (const [k, arr] of Object.entries(h)) {
+      for (const meta of (Array.isArray(arr) ? arr : [arr])) all.push([k, meta]);
+    }
+    if (all.length > 600) {
+      all.sort((a, b) => (a[1].time || 0) - (b[1].time || 0));
+      const removeCount = all.length - 600;
+      for (let i = 0; i < removeCount; i++) {
+        const [k, meta] = all[i];
+        if (!Array.isArray(h[k])) delete h[k];
+        else {
+          const idx = h[k].findIndex(x => x.id === meta.id && x.time === meta.time);
+          if (idx >= 0) h[k].splice(idx, 1);
+          if (!h[k].length) delete h[k];
+        }
+      }
+    }
+    localStorage.setItem(STORAGE_HISTORY, JSON.stringify(h));
+  }
+
+  function remember(item) {
+    if (!item) return;
+    const word = String(item.word || item.palavra || item.text || item.message || '').trim();
+    const key = normalize(word);
+    if (!key) return;
+
+    const meta = {
+      id: String(item.id || item.messageId || item.message_id || `${Date.now()}-${Math.random()}`),
+      word,
+      nick: String(item.nick || item.username || item.user || item.displayName || item.display_name || 'CHAT').trim() || 'CHAT',
+      color: safeColor(item.color || item.colour || item.userColor || item.user_color),
+      time: Date.now()
+    };
+
+    const h = loadHistory();
+    if (!Array.isArray(h[key])) h[key] = [];
+    if (!h[key].some(x => x.id === meta.id)) h[key].push(meta);
+    h[key].sort((a, b) => (a.time || 0) - (b.time || 0));
+    saveHistory(h);
+  }
 
   function httpGet(url) {
     return new Promise((resolve, reject) => {
       if (typeof GM_xmlhttpRequest === 'function') {
         GM_xmlhttpRequest({
           method: 'GET', url, timeout: 10000,
-          onload: r => {
-            try { resolve(JSON.parse(r.responseText)); } catch (e) { reject(e); }
-          },
+          onload: r => { try { resolve(JSON.parse(r.responseText)); } catch (e) { reject(e); } },
           onerror: reject,
           ontimeout: reject
         });
@@ -52,106 +109,81 @@
     });
   }
 
-  function normalizeWord(s) {
-    return String(s || '')
-      .trim()
-      .toLowerCase()
-      .normalize('NFD')
-      .replace(/[\u0300-\u036f]/g, '');
-  }
-
-  function escapeRegex(s) {
-    return String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  function saveLastId(id) {
+    lastId = id || lastId;
+    localStorage.setItem(STORAGE_LAST_ID, lastId);
+    localStorage.setItem(STORAGE_FAILSAFE_LAST_ID, lastId);
   }
 
   function enqueue(item, origin) {
-    if (!item || (item.type && item.type !== 'guess')) return;
-    if (!item.id || !item.word) return;
-    if (item.id === lastId) return;
-    if (queue.some(x => x.id === item.id)) return;
+    if (!item || item.type !== 'guess' || !item.id || !item.word) return;
+    if (String(item.id) === String(lastId)) return;
+    if (queue.some(x => String(x.id) === String(item.id))) return;
 
-    lastId = item.id;
-    localStorage.setItem('contextoChatLastId_v16', lastId);
+    remember(item);
+    saveLastId(String(item.id));
     queue.push(item);
-    if (queue.length > MAX_QUEUE) queue = queue.slice(-MAX_QUEUE);
-    receivedCount++;
-    log('recebido via', origin, item);
+    log('recebido', origin, item.nick, item.word);
+    annotateAllRowsSoon();
   }
 
-  function startWebSocket() {
-    if (!baseUrl() || baseUrl().includes('COLE_AQUI')) {
-      console.warn('[Contexto Chat] Coloque o link do Render no RENDER_URL do script.');
+  function startWs() {
+    const url = baseUrl();
+    if (!url || url.includes('COLE_AQUI')) {
+      console.error('[Contexto Chat FINAL] Você precisa colocar o link do Render em RENDER_URL.');
       return;
     }
-    try {
-      const wsUrl = baseUrl().replace(/^https:/i, 'wss:').replace(/^http:/i, 'ws:');
-      ws = new WebSocket(wsUrl);
-      ws.onopen = () => log('websocket conectado');
-      ws.onclose = () => setTimeout(startWebSocket, 3000);
-      ws.onerror = () => log('websocket erro, polling continua funcionando');
-      ws.onmessage = (ev) => {
-        try {
-          const data = JSON.parse(ev.data);
-          if (data.type === 'hello') {
-            const recent = Array.isArray(data.recent) ? data.recent : [];
-            if (!lastId && recent.length) {
-              lastId = recent[recent.length - 1].id;
-              localStorage.setItem('contextoChatLastId_v16', lastId);
+
+    function connect(wsUrl) {
+      try {
+        ws = new WebSocket(wsUrl);
+        ws.onopen = () => log('WebSocket OK:', wsUrl);
+        ws.onclose = () => setTimeout(() => connect(wsUrl), 3000);
+        ws.onerror = () => {};
+        ws.onmessage = ev => {
+          try {
+            const data = JSON.parse(ev.data);
+            if (data.type === 'hello') {
+              const recent = Array.isArray(data.recent) ? data.recent : [];
+              for (const it of recent) remember(it);
+              if (!lastId && recent.length) saveLastId(String(recent[recent.length - 1].id));
+              annotateAllRowsSoon();
+              return;
             }
-            return;
-          }
-          enqueue(data, 'websocket');
-        } catch (e) { log('ws json erro', e); }
-      };
-    } catch (e) {
-      log('ws falhou', e);
+            enqueue(data, 'ws');
+          } catch (e) { log('erro ws', e); }
+        };
+      } catch (e) { log('ws falhou', e); }
     }
+
+    // O servidor do pacote usa WebSocket na raiz. Não usa /ws.
+    const wsUrl = url.replace(/^https:/i, 'wss:').replace(/^http:/i, 'ws:');
+    connect(wsUrl);
   }
 
   async function poll() {
-    if (!baseUrl() || baseUrl().includes('COLE_AQUI')) return;
+    const url = baseUrl();
+    if (!url || url.includes('COLE_AQUI')) return;
     try {
-      const data = await httpGet(`${baseUrl()}/api/queue?after=${encodeURIComponent(lastId || '')}&t=${Date.now()}`);
+      const data = await httpGet(`${url}/api/queue?after=${encodeURIComponent(lastId || '')}&t=${Date.now()}`);
+      if (!lastId && data.latestId) saveLastId(String(data.latestId));
       const items = Array.isArray(data.items) ? data.items : [];
-      if (!lastId && data.latestId) {
-        lastId = data.latestId;
-        localStorage.setItem('contextoChatLastId_v16', lastId);
-      }
-      for (const item of items) enqueue(item, 'polling');
+      for (const item of items) enqueue(item, 'poll');
     } catch (e) {
       log('poll falhou', e && e.message ? e.message : e);
     }
   }
 
-
-  async function importRecentFromStatus() {
-    if (!baseUrl() || baseUrl().includes('COLE_AQUI')) return;
-    try {
-      const data = await httpGet(`${baseUrl()}/api/status?t=${Date.now()}`);
-      const recent = Array.isArray(data.recent) ? data.recent : [];
-      for (const item of recent) {
-        if (!item || item.type !== 'guess' || !item.word || !item.nick) continue;
-        addNickHistory({
-          id: item.id || `${item.nick}:${item.word}:${item.time || ''}`,
-          nick: item.nick || 'chat',
-          color: item.color || '#ffffff',
-          word: item.word,
-          norm: normalizeWord(item.word),
-          time: item.time || Date.now()
-        });
-      }
-    } catch (e) {
-      log('status recente falhou', e && e.message ? e.message : e);
-    }
-  }
-
   function getInput() {
-    const inputs = Array.from(document.querySelectorAll('input, textarea')).filter(el => {
+    const all = Array.from(document.querySelectorAll('input, textarea'));
+    return all.find(el => {
       const r = el.getBoundingClientRect();
       const st = getComputedStyle(el);
-      return r.width > 100 && r.height > 20 && st.display !== 'none' && st.visibility !== 'hidden' && !el.disabled && !el.readOnly;
-    });
-    return inputs.find(el => /text|search|^$/.test(el.type || '')) || inputs[0] || null;
+      if (el.disabled || el.readOnly) return false;
+      if (st.display === 'none' || st.visibility === 'hidden') return false;
+      if (r.width < 250 || r.height < 30) return false;
+      return true;
+    }) || all.find(el => !el.disabled && !el.readOnly) || null;
   }
 
   function setNativeValue(el, value) {
@@ -161,59 +193,126 @@
     else el.value = value;
   }
 
-  function fireInputEvents(el, value) {
+  function reactProps(el) {
+    const k = Object.keys(el).find(x => x.startsWith('__reactProps$') || x.startsWith('__reactEventHandlers$'));
+    return k ? el[k] : null;
+  }
+
+  function fillInput(el, value) {
     el.focus();
+    el.click();
     setNativeValue(el, '');
-    el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'deleteContentBackward', data: null }));
+    el.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
     setNativeValue(el, value);
-    el.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, cancelable: true, inputType: 'insertText', data: value }));
-    el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertText', data: value }));
-    el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+
+    const inputEv = (() => {
+      try { return new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertText', data: value, composed: true }); }
+      catch (_) { return new Event('input', { bubbles: true, cancelable: true, composed: true }); }
+    })();
+    el.dispatchEvent(inputEv);
+    el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true, composed: true }));
+
+    const props = reactProps(el);
+    if (props && typeof props.onChange === 'function') {
+      try { props.onChange({ target: el, currentTarget: el, nativeEvent: inputEv, preventDefault(){}, stopPropagation(){} }); } catch (_) {}
+    }
   }
 
   function fireEnter(el) {
-    const opts = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true, composed: true };
-    el.dispatchEvent(new KeyboardEvent('keydown', opts));
-    el.dispatchEvent(new KeyboardEvent('keypress', opts));
-    el.dispatchEvent(new KeyboardEvent('keyup', opts));
+    const opts = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, charCode: 13, bubbles: true, cancelable: true, composed: true };
+    const props = reactProps(el);
+    for (const type of ['keydown', 'keypress', 'keyup']) {
+      try { el.dispatchEvent(new KeyboardEvent(type, opts)); } catch (_) {}
+    }
+    if (props) {
+      const fake = { ...opts, target: el, currentTarget: el, nativeEvent: {}, defaultPrevented: false, preventDefault(){ this.defaultPrevented = true; }, stopPropagation(){} };
+      try { if (typeof props.onKeyDown === 'function') props.onKeyDown(fake); } catch (_) {}
+      try { if (typeof props.onKeyPress === 'function') props.onKeyPress(fake); } catch (_) {}
+      try { if (typeof props.onKeyUp === 'function') props.onKeyUp(fake); } catch (_) {}
+    }
   }
 
-  function fireSyntheticSubmit(el) {
+  function fireSubmit(el) {
     const form = el.closest('form');
-    if (!form) return false;
-    let ev;
-    try { ev = new SubmitEvent('submit', { bubbles: true, cancelable: true }); }
-    catch (_) { ev = new Event('submit', { bubbles: true, cancelable: true }); }
-    form.dispatchEvent(ev);
-    ev.preventDefault();
-    return true;
+    if (!form) return;
+    const ev = typeof SubmitEvent === 'function'
+      ? new SubmitEvent('submit', { bubbles: true, cancelable: true, composed: true })
+      : new Event('submit', { bubbles: true, cancelable: true, composed: true });
+    form.dispatchEvent(ev); // não usa requestSubmit e não clica em botão, para não recarregar.
+
+    const props = reactProps(form);
+    if (props && typeof props.onSubmit === 'function') {
+      try { props.onSubmit({ target: form, currentTarget: form, nativeEvent: ev, preventDefault(){}, stopPropagation(){} }); } catch (_) {}
+    }
   }
 
-  async function sendToContexto(item) {
+  function clickSafeButtonNearInput(el) {
+    // Só tenta botão dentro do mesmo form; evita menu, voltar, anúncio, três pontinhos etc.
+    const form = el.closest('form');
+    if (!form) return;
+    const buttons = Array.from(form.querySelectorAll('button, input[type="submit"]')).filter(b => {
+      const r = b.getBoundingClientRect();
+      return !b.disabled && r.width > 5 && r.height > 5;
+    });
+    const b = buttons.find(x => (x.type || '').toLowerCase() === 'submit') || buttons[0];
+    if (b) {
+      try { b.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, composed: true })); } catch (_) {}
+    }
+  }
+
+  function currentAttemptCount() {
+    const txt = document.body.innerText || '';
+    const m = txt.match(/TENTATIVAS:\s*(\d+)/i);
+    return m ? Number(m[1]) : NaN;
+  }
+
+  async function sendWord(item) {
     const word = String(item.word || '').trim();
     if (!word) return false;
+
+    remember(item);
     const input = getInput();
-    if (!input) { log('não achei input'); return false; }
+    if (!input) { log('campo do Contexto não encontrado'); return false; }
 
-    fireInputEvents(input, word);
-    await sleep(120);
-    fireEnter(input);
-    await sleep(220);
-    fireSyntheticSubmit(input);
-    await sleep(250);
-    fireEnter(input);
+    const beforeAttempts = currentAttemptCount();
+    const beforeRows = resultRows().length;
 
-    addNickHistory({
-      id: item.id || String(Date.now()),
-      nick: item.nick || 'chat',
-      color: item.color || '#ffffff',
-      word,
-      norm: normalizeWord(word),
-      time: Date.now()
-    });
-    sentCount++;
-    log('enviado', word, item.nick, 'recebidas', receivedCount, 'enviadas', sentCount);
-    return true;
+    fillInput(input, word);
+    await sleep(80);
+    fireEnter(input);
+    await sleep(180);
+    fireSubmit(input);
+    await sleep(180);
+
+    // Se ainda estiver no campo, tenta Enter de novo. Não usa requestSubmit.
+    if (String(input.value || '').trim().toLowerCase() === word.toLowerCase()) {
+      fireEnter(input);
+      await sleep(220);
+      fireSubmit(input);
+      await sleep(220);
+    }
+
+    // Último fallback seguro: botão dentro do form, se existir.
+    if (String(input.value || '').trim().toLowerCase() === word.toLowerCase()) {
+      clickSafeButtonNearInput(input);
+    }
+
+    const start = Date.now();
+    while (Date.now() - start < WAIT_RESULT_MS) {
+      annotateAllRows();
+      const found = resultRows().some(row => parseRow(row).wordNorm === normalize(word));
+      const afterAttempts = currentAttemptCount();
+      if (found || resultRows().length > beforeRows || (!Number.isNaN(beforeAttempts) && afterAttempts > beforeAttempts)) {
+        annotateAllRows();
+        return true;
+      }
+      await sleep(250);
+    }
+
+    // Não apaga o campo à força; só avisa no console para não esconder erro do Contexto.
+    log('não confirmou envio no Contexto:', word);
+    annotateAllRows();
+    return false;
   }
 
   async function processQueue() {
@@ -221,281 +320,150 @@
     sending = true;
     try {
       const item = queue.shift();
-      await sendToContexto(item);
-      await sleep(SEND_DELAY_MS);
-      injectNicks();
-    } catch (e) { console.error('[Contexto Chat] erro', e); }
-    finally { sending = false; }
+      await sendWord(item);
+      await sleep(BETWEEN_WORDS_MS);
+      annotateAllRows();
+    } catch (e) {
+      console.error('[Contexto Chat FINAL]', e);
+    } finally {
+      sending = false;
+    }
   }
 
-  function visible(el) {
-    const r = el.getBoundingClientRect();
-    const st = getComputedStyle(el);
-    return r.width > 0 && r.height > 0 && st.display !== 'none' && st.visibility !== 'hidden';
+  function ensureStyle() {
+    if (document.getElementById('ctx-chat-final-style')) return;
+    const style = document.createElement('style');
+    style.id = 'ctx-chat-final-style';
+    style.textContent = `
+      .ctx-chat-final-nick {
+        position: absolute !important;
+        right: 76px !important;
+        top: 50% !important;
+        transform: translateY(-50%) !important;
+        z-index: 2147483647 !important;
+        pointer-events: none !important;
+        font-weight: 900 !important;
+        font-size: 14px !important;
+        line-height: 1 !important;
+        max-width: 155px !important;
+        overflow: hidden !important;
+        text-overflow: ellipsis !important;
+        white-space: nowrap !important;
+        text-shadow: 0 1px 2px rgba(0,0,0,.95), 0 0 4px rgba(0,0,0,.95) !important;
+        font-family: inherit !important;
+      }
+    `;
+    document.documentElement.appendChild(style);
   }
 
-  function elementText(el) {
-    return (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
-  }
-
-  function rowTextWithoutOurNick(el) {
+  function textWithoutNick(el) {
     const clone = el.cloneNode(true);
-    clone.querySelectorAll && clone.querySelectorAll('.ctx-chat-nick').forEach(n => n.remove());
+    clone.querySelectorAll('.ctx-chat-final-nick').forEach(n => n.remove());
     return (clone.innerText || clone.textContent || '').replace(/\s+/g, ' ').trim();
   }
 
-  function looksLikeRankRow(el, wordNorm) {
-    if (!visible(el)) return false;
-    if (el.querySelector('input, textarea, iframe, video, canvas')) return false;
-    if (el.classList && el.classList.contains('ctx-chat-nick')) return false;
+  function parseRow(el) {
+    const txt = textWithoutNick(el);
+    if (!txt) return { word: '', wordNorm: '', rank: '' };
+    const low = txt.toLowerCase();
+    if (low.includes('tentativas') || low.includes('contexto') || low.includes('digite uma palavra')) return { word: '', wordNorm: '', rank: '' };
+    if (low.includes('essa palavra') || low.includes('não vale') || low.includes('como jogar') || low.includes('tutorial')) return { word: '', wordNorm: '', rank: '' };
+    if (/\d{2}\/\d{2}\/\d{4}/.test(txt)) return { word: '', wordNorm: '', rank: '' };
 
+    // Quadrinho do Contexto: palavra + número no final. Pega uma única palavra como chute.
+    const m = txt.match(/^([\p{L}][\p{L}'’.-]{0,70})\s+(\d{1,7})$/u);
+    if (!m) return { word: '', wordNorm: '', rank: '' };
+    return { word: m[1], wordNorm: normalize(m[1]), rank: m[2] };
+  }
+
+  function visibleRowLike(el) {
+    if (!(el instanceof HTMLElement)) return false;
+    if (el.closest('input, textarea, form, header, nav, iframe, script, style, svg, canvas, video')) return false;
     const r = el.getBoundingClientRect();
-    const txt = rowTextWithoutOurNick(el);
-    const norm = normalizeWord(txt);
-
-    // Evita pegar tela inteira, container pai, tutorial, anúncios etc.
-    if (r.width < 180 || r.width > 760) return false;
-    if (r.height < 22 || r.height > 72) return false;
-    if (txt.length < 3 || txt.length > 140) return false;
-    if (!/\d{1,6}\s*$/.test(txt)) return false;
-
-    // Linha do Contexto é basicamente: palavra ... número. Aceita a palavra no começo da linha.
-    // Isso corrige casos em que o nick antigo ou o destaque mudam o texto interno.
-    const startRe = new RegExp(`^\\s*${escapeRegex(wordNorm)}(\\s|$)`, 'i');
-    const separateRe = new RegExp(`(^|\\s)${escapeRegex(wordNorm)}(\\s|$|\\d)`, 'i');
-    return startRe.test(norm) || separateRe.test(norm);
-  }
-
-  function findBestRow(word) {
-    const wordNorm = normalizeWord(word);
-    if (!wordNorm) return null;
-
-    const all = Array.from(document.querySelectorAll('div, li, tr, a, button'));
-    const candidates = all.filter(el => looksLikeRankRow(el, wordNorm));
-    if (!candidates.length) return null;
-
-    // Pega o elemento mais profundo e menor. Isso evita jogar o nick fora da linha.
-    candidates.sort((a, b) => {
-      const ar = a.getBoundingClientRect();
-      const br = b.getBoundingClientRect();
-      const areaA = ar.width * ar.height;
-      const areaB = br.width * br.height;
-      const depthA = getDepth(a);
-      const depthB = getDepth(b);
-      if (depthA !== depthB) return depthB - depthA;
-      return areaA - areaB;
-    });
-    return candidates[0];
-  }
-
-  function getDepth(el) {
-    let d = 0;
-    while (el && el.parentElement) { d++; el = el.parentElement; }
-    return d;
-  }
-
-  function findRankElement(row) {
-    const kids = Array.from(row.querySelectorAll(':scope > *')).filter(visible);
-    const directRank = kids.find(el => /^#?\d{1,6}$/.test(elementText(el)));
-    if (directRank) return directRank;
-
-    const all = Array.from(row.querySelectorAll('*')).filter(visible);
-    const exact = all.find(el => /^#?\d{1,6}$/.test(elementText(el)));
-    if (exact) return exact;
-
-    return null;
-  }
-
-  function insertNickInsideRow(row, info) {
-    if (!row || row.querySelector('.ctx-chat-nick')) return false;
-
-    const nick = document.createElement('span');
-    nick.className = 'ctx-chat-nick';
-    nick.textContent = info.nick;
-    nick.title = `${info.nick} mandou: ${info.word}`;
-    nick.style.cssText = [
-      'color:' + (info.color || '#fff'),
-      'font-weight:700',
-      'font-size:.88em',
-      'line-height:1',
-      'white-space:nowrap',
-      'text-shadow:0 1px 2px rgba(0,0,0,.75)',
-      'display:inline-block',
-      'vertical-align:middle',
-      'max-width:120px',
-      'overflow:hidden',
-      'text-overflow:ellipsis',
-      'margin-left:8px',
-      'margin-right:8px'
-    ].join(';');
-
-    const rankEl = findRankElement(row);
-    if (rankEl && rankEl.parentElement) {
-      rankEl.parentElement.insertBefore(nick, rankEl);
-      return true;
-    }
-
-    // Fallback: não cria nada fora do quadrinho. Só coloca no fim da própria linha.
-    row.appendChild(nick);
+    const st = getComputedStyle(el);
+    if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') return false;
+    if (r.width < 250 || r.width > 820 || r.height < 24 || r.height > 85) return false;
+    if (r.bottom < 0 || r.top > innerHeight) return false;
     return true;
   }
 
-  function loadNickHistory() {
-    try {
-      const arr = JSON.parse(localStorage.getItem(historyKey) || '[]');
-      return Array.isArray(arr) ? arr.filter(x => x && x.word && x.nick).slice(-250) : [];
-    } catch (_) {
-      return [];
+  function candidateRows() {
+    const all = Array.from(document.querySelectorAll('body *'));
+    const candidates = [];
+    for (const el of all) {
+      if (!visibleRowLike(el)) continue;
+      const p = parseRow(el);
+      if (!p.wordNorm || !p.rank) continue;
+      const r = el.getBoundingClientRect();
+      candidates.push({ el, parsed: p, area: r.width * r.height, top: Math.round(r.top) });
+    }
+
+    // Mantém o candidato mais largo/externo para cada palavra+rank+posição vertical.
+    const byLine = new Map();
+    for (const c of candidates) {
+      const k = `${c.parsed.wordNorm}|${c.parsed.rank}|${Math.round(c.top / 3)}`;
+      const old = byLine.get(k);
+      if (!old || c.area > old.area) byLine.set(k, c);
+    }
+    return Array.from(byLine.values()).sort((a, b) => a.top - b.top);
+  }
+
+  function resultRows() {
+    return candidateRows().map(x => x.el);
+  }
+
+  function metaForRow(wordNorm, occurrenceIndex) {
+    const h = loadHistory();
+    const arr = h[wordNorm];
+    if (!Array.isArray(arr) || !arr.length) return null;
+    return arr[Math.min(occurrenceIndex, arr.length - 1)] || arr[arr.length - 1];
+  }
+
+  function annotateAllRows() {
+    ensureStyle();
+    const rows = candidateRows();
+    const counts = Object.create(null);
+
+    for (const { el, parsed } of rows) {
+      const key = parsed.wordNorm;
+      const idx = counts[key] || 0;
+      counts[key] = idx + 1;
+      const meta = metaForRow(key, idx);
+
+      el.querySelectorAll(':scope > .ctx-chat-final-nick').forEach(n => n.remove());
+      if (!meta) continue; // palavra manual ou sem histórico do chat: não inventa nick.
+
+      if (getComputedStyle(el).position === 'static') el.style.position = 'relative';
+      if (getComputedStyle(el).overflow === 'hidden') el.style.overflow = 'visible';
+
+      const nick = document.createElement('span');
+      nick.className = 'ctx-chat-final-nick';
+      nick.textContent = meta.nick || 'CHAT';
+      nick.title = meta.nick || 'CHAT';
+      nick.style.color = safeColor(meta.color);
+      el.appendChild(nick);
     }
   }
 
-  function saveNickHistory() {
-    try { localStorage.setItem(historyKey, JSON.stringify(nickHistory.slice(-250))); } catch (_) {}
+  let annTimer = null;
+  function annotateAllRowsSoon() {
+    clearTimeout(annTimer);
+    annTimer = setTimeout(annotateAllRows, 80);
   }
 
-  function addNickHistory(info) {
-    if (!info || !info.word || !info.nick) return;
-    info.norm = info.norm || normalizeWord(info.word);
-    info.time = info.time || Date.now();
-
-    // Evita repetir a mesma mensagem recebida duas vezes pelo WebSocket + polling/status.
-    if (info.id) {
-      const i = nickHistory.findIndex(x => x.id === info.id);
-      if (i >= 0) {
-        nickHistory[i] = Object.assign({}, nickHistory[i], info);
-        saveNickHistory();
-        return;
-      }
-    }
-    nickHistory.push(info);
-    if (nickHistory.length > 400) nickHistory = nickHistory.slice(-400);
-    saveNickHistory();
-  }
-
-  function findAllRowsForWord(word) {
-    const wordNorm = normalizeWord(word);
-    if (!wordNorm) return [];
-    const all = Array.from(document.querySelectorAll('div, li, tr, a, button'));
-    let candidates = all.filter(el => looksLikeRankRow(el, wordNorm));
-    if (!candidates.length) return [];
-
-    // Remove pais quando também existe um filho candidato. Assim não mexe no container inteiro.
-    let deepest = candidates.filter(el => !candidates.some(other => other !== el && el.contains(other)));
-
-    // Preferir linhas cujo texto começa com a palavra. Isso evita pegar wrapper pai quando existe anúncio/layout junto.
-    const exactStart = deepest.filter(el => {
-      const norm = normalizeWord(rowTextWithoutOurNick(el));
-      return new RegExp(`^\\s*${escapeRegex(wordNorm)}(\\s|$)`, 'i').test(norm);
-    });
-    if (exactStart.length) deepest = exactStart;
-
-    deepest.sort((a, b) => {
-      const ar = a.getBoundingClientRect();
-      const br = b.getBoundingClientRect();
-      if (Math.abs(ar.top - br.top) > 2) return ar.top - br.top;
-      return ar.left - br.left;
-    });
-    return deepest;
-  }
-
-  function clearWrongFloatingNicks() {
-    // Remove nicks que versões antigas possam ter deixado fora dos quadrinhos.
-    for (const nick of Array.from(document.querySelectorAll('.ctx-chat-nick'))) {
-      const row = nick.closest('div, li, tr, a, button');
-      if (!row || !/\d{1,6}\s*$/.test(elementText(row))) nick.remove();
-    }
-
-    // Limpa duplicados que ficaram de versões anteriores: mantém apenas o primeiro
-    // temporariamente; a função insertOrUpdateNickInsideRow vai recriar certo.
-    const rows = Array.from(document.querySelectorAll('div, li, tr, a, button'));
-    for (const row of rows) {
-      const nicks = Array.from(row.querySelectorAll(':scope > .ctx-chat-nick, :scope .ctx-chat-nick'));
-      if (nicks.length > 1) nicks.slice(1).forEach(n => n.remove());
-    }
-  }
-
-  function insertOrUpdateNickInsideRow(row, info, slot) {
-    if (!row || !info) return false;
-
-    // CORREÇÃO: o Contexto recria/reorganiza elementos e versões anteriores podiam
-    // deixar 2+ spans do nick na mesma linha. Antes de inserir, limpa todos os nicks
-    // que já estão dentro desse quadrinho. Resultado: sempre fica só 1 nick por linha.
-    for (const oldNick of Array.from(row.querySelectorAll('.ctx-chat-nick'))) {
-      oldNick.remove();
-    }
-
-    const nick = document.createElement('span');
-    nick.className = 'ctx-chat-nick';
-    nick.dataset.ctxSlot = String(slot);
-    nick.textContent = info.nick;
-    nick.title = `${info.nick} mandou: ${info.word}`;
-    nick.style.cssText = [
-      'color:' + (info.color || '#fff'),
-      'font-weight:700',
-      'font-size:.88em',
-      'line-height:1',
-      'white-space:nowrap',
-      'text-shadow:0 1px 2px rgba(0,0,0,.75)',
-      'display:inline-block',
-      'vertical-align:middle',
-      'max-width:120px',
-      'overflow:hidden',
-      'text-overflow:ellipsis',
-      'margin-left:8px',
-      'margin-right:8px',
-      'pointer-events:none'
-    ].join(';');
-
-    const rankEl = findRankElement(row);
-    if (rankEl && rankEl.parentElement && row.contains(rankEl)) {
-      rankEl.parentElement.insertBefore(nick, rankEl);
-      return true;
-    }
-
-    // Fallback seguro: ainda fica dentro da própria linha, nunca solto na tela.
-    row.appendChild(nick);
-    return true;
-  }
-
-  function injectNicks() {
-    clearWrongFloatingNicks();
-
-    const now = Date.now();
-    // Mantém histórico por um bom tempo, porque o Contexto recria as linhas e apaga alterações antigas.
-    nickHistory = nickHistory.filter(x => now - (x.time || 0) < 6 * 60 * 60 * 1000);
-
-    const groups = new Map();
-    for (const info of nickHistory) {
-      const norm = info.norm || normalizeWord(info.word);
-      if (!norm) continue;
-      if (!groups.has(norm)) groups.set(norm, []);
-      groups.get(norm).push(info);
-    }
-
-    for (const infos of groups.values()) {
-      // Mais recentes primeiro, porque a linha destacada/nova costuma aparecer acima.
-      infos.sort((a, b) => (b.time || 0) - (a.time || 0));
-      const rows = findAllRowsForWord(infos[0].word);
-      rows.forEach((row, idx) => {
-        const info = infos[idx] || infos[0];
-        insertOrUpdateNickInsideRow(row, info, idx);
-      });
-    }
-
-    saveNickHistory();
-  }
-
-  // Bloqueia submit real que causava volta para a tela inicial, mas não cria painel nem mexe no layout.
-  document.addEventListener('submit', function (e) {
-    if (e.isTrusted) {
-      e.preventDefault();
-      e.stopPropagation();
-      log('submit real bloqueado');
-    }
+  // Impede recarregamento nativo, mas NÃO usa stopPropagation para não bloquear o React/Vue do jogo.
+  document.addEventListener('submit', (e) => {
+    if (location.hostname.includes('contexto.me')) e.preventDefault();
   }, true);
 
-  startWebSocket();
-  setInterval(async () => { await poll(); await processQueue(); injectNicks(); }, POLL_MS);
-  setInterval(async () => { await importRecentFromStatus(); injectNicks(); }, 2500);
-  setInterval(injectNicks, 1000);
+  const observer = new MutationObserver(() => annotateAllRowsSoon());
+  observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
+
+  startWs();
+  setInterval(async () => {
+    await poll();
+    await processQueue();
+    annotateAllRows();
+  }, POLL_MS);
+  setInterval(annotateAllRows, 500);
 })();
