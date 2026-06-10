@@ -12,12 +12,8 @@ app.use(express.static('public'));
 
 const PORT = process.env.PORT || 10000;
 const TWITCH_CHANNEL = (process.env.TWITCH_CHANNEL || '').replace(/^@/, '').trim().toLowerCase();
-
-// MODO SEM COMANDO: por padrão qualquer mensagem curta de 1 palavra vira tentativa.
 const ACCEPT_ALL_MESSAGES = String(process.env.ACCEPT_ALL_MESSAGES || 'true').toLowerCase() === 'true';
 const COMMAND_PREFIX = process.env.COMMAND_PREFIX || '!c';
-
-// Filtros para não jogar qualquer coisa errada no Contexto.
 const MAX_WORD_LENGTH = Number(process.env.MAX_WORD_LENGTH || 35);
 const IGNORE_COMMANDS = String(process.env.IGNORE_COMMANDS || 'true').toLowerCase() === 'true';
 const ALLOW_NUMBERS = String(process.env.ALLOW_NUMBERS || 'false').toLowerCase() === 'true';
@@ -26,8 +22,27 @@ const PANEL_PASSWORD = process.env.PANEL_PASSWORD || '';
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 const recent = [];
+const rawMessages = [];
+const rejected = [];
+const status = {
+  startedAt: new Date().toISOString(),
+  twitchChannel: TWITCH_CHANNEL || null,
+  twitchConnected: false,
+  twitchConnectionError: null,
+  lastTwitchMessageAt: null,
+  lastAcceptedAt: null,
+  totalRaw: 0,
+  totalAccepted: 0,
+  totalRejected: 0,
+  websocketClients: 0
+};
 
-function safeText(v, max = 80) {
+function pushLimited(arr, item, max = 30) {
+  arr.push(item);
+  while (arr.length > max) arr.shift();
+}
+
+function safeText(v, max = 120) {
   return String(v || '')
     .replace(/[\r\n\t]/g, ' ')
     .replace(/\s+/g, ' ')
@@ -36,24 +51,30 @@ function safeText(v, max = 80) {
 }
 
 function stripEdges(v) {
-  // Remove pontuação só das pontas, mantendo acentos/letras no meio.
   return String(v || '').replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '');
 }
 
 function normalizeWord(v) {
-  return stripEdges(safeText(v, MAX_WORD_LENGTH + 10)).toLowerCase();
+  return stripEdges(safeText(v, MAX_WORD_LENGTH + 30)).toLowerCase();
+}
+
+function reject(reason, extra = {}) {
+  status.totalRejected++;
+  const item = { time: new Date().toISOString(), reason, ...extra };
+  pushLimited(rejected, item, 40);
+  console.log('[REJEITADO]', reason, extra);
+  return null;
 }
 
 function isValidContextoWord(word) {
-  if (!word) return false;
-  if (word.length > MAX_WORD_LENGTH) return false;
-  if (/\s/.test(word)) return false; // não aceita frase
-  if (/https?:\/\//i.test(word) || /^www\./i.test(word)) return false;
-  if (word.startsWith('@') || word.startsWith('#')) return false;
-  if (!ALLOW_NUMBERS && /\p{N}/u.test(word)) return false;
-
-  // Aceita palavras com letras, acentos e hífen/apóstrofo simples no meio.
-  return /^[\p{L}]+(?:[-'’][\p{L}]+)*$/u.test(word);
+  if (!word) return 'vazio';
+  if (word.length > MAX_WORD_LENGTH) return 'maior que MAX_WORD_LENGTH';
+  if (/\s/.test(word)) return 'tem espaço/frase';
+  if (/https?:\/\//i.test(word) || /^www\./i.test(word)) return 'link';
+  if (word.startsWith('@') || word.startsWith('#')) return '@ ou #';
+  if (!ALLOW_NUMBERS && /\p{N}/u.test(word)) return 'tem número e ALLOW_NUMBERS=false';
+  if (!/^[\p{L}]+(?:[-'’][\p{L}]+)*$/u.test(word)) return 'não parece palavra';
+  return '';
 }
 
 function sendAll(payload) {
@@ -61,6 +82,7 @@ function sendAll(payload) {
   for (const client of wss.clients) {
     if (client.readyState === WebSocket.OPEN) client.send(msg);
   }
+  status.websocketClients = [...wss.clients].filter(c => c.readyState === WebSocket.OPEN).length;
 }
 
 function addGuess({ nick, word, color, source }) {
@@ -69,7 +91,8 @@ function addGuess({ nick, word, color, source }) {
   color = /^#[0-9a-f]{6}$/i.test(color || '') ? color : '#00d5ff';
   source = safeText(source, 20) || 'manual';
 
-  if (!isValidContextoWord(word)) return null;
+  const invalidReason = isValidContextoWord(word);
+  if (invalidReason) return reject(invalidReason, { nick, word, source });
 
   const payload = {
     type: 'guess',
@@ -81,77 +104,91 @@ function addGuess({ nick, word, color, source }) {
     time: new Date().toISOString()
   };
 
-  recent.push(payload);
-  while (recent.length > 50) recent.shift();
+  status.totalAccepted++;
+  status.lastAcceptedAt = payload.time;
+  pushLimited(recent, payload, 80);
+  console.log('[ACEITO]', `${nick}: ${word}`, source, color);
   sendAll(payload);
   return payload;
 }
 
 wss.on('connection', (ws) => {
+  status.websocketClients = [...wss.clients].filter(c => c.readyState === WebSocket.OPEN).length;
   ws.send(JSON.stringify({ type: 'hello', recent }));
+  ws.on('close', () => {
+    status.websocketClients = [...wss.clients].filter(c => c.readyState === WebSocket.OPEN).length;
+  });
 });
 
 app.get('/health', (req, res) => {
-  res.json({
-    ok: true,
-    channel: TWITCH_CHANNEL || null,
-    mode: ACCEPT_ALL_MESSAGES ? 'sem_comando' : 'com_prefixo',
-    prefix: COMMAND_PREFIX,
-    maxWordLength: MAX_WORD_LENGTH,
-    ignoreCommands: IGNORE_COMMANDS
-  });
+  res.json({ ok: true, ...status, mode: ACCEPT_ALL_MESSAGES ? 'sem_comando' : 'com_prefixo', prefix: COMMAND_PREFIX, maxWordLength: MAX_WORD_LENGTH, ignoreCommands: IGNORE_COMMANDS, allowNumbers: ALLOW_NUMBERS });
+});
+
+app.get('/api/status', (req, res) => {
+  res.json({ ok: true, status, config: { mode: ACCEPT_ALL_MESSAGES ? 'sem_comando' : 'com_prefixo', prefix: COMMAND_PREFIX, maxWordLength: MAX_WORD_LENGTH, ignoreCommands: IGNORE_COMMANDS, allowNumbers: ALLOW_NUMBERS }, recent, rawMessages, rejected });
 });
 
 app.post('/api/submit', (req, res) => {
   if (PANEL_PASSWORD && req.body.password !== PANEL_PASSWORD) {
     return res.status(401).json({ ok: false, error: 'Senha errada' });
   }
-  const payload = addGuess({
-    nick: req.body.nick,
-    word: req.body.word,
-    color: req.body.color,
-    source: 'site'
-  });
-  if (!payload) return res.status(400).json({ ok: false, error: 'Palavra inválida. Use só 1 palavra curta.' });
+  const payload = addGuess({ nick: req.body.nick, word: req.body.word, color: req.body.color, source: 'site' });
+  if (!payload) return res.status(400).json({ ok: false, error: 'Palavra inválida ou bloqueada pelo filtro. Veja /status.html.' });
   res.json({ ok: true, payload });
 });
 
 if (TWITCH_CHANNEL) {
   const client = new tmi.Client({
+    options: { debug: false },
     connection: { reconnect: true, secure: true },
     channels: [TWITCH_CHANNEL]
   });
 
   client.connect().then(() => {
-    console.log('Lendo chat da Twitch:', TWITCH_CHANNEL);
-    console.log('Modo:', ACCEPT_ALL_MESSAGES ? 'sem comando' : 'com prefixo ' + COMMAND_PREFIX);
+    status.twitchConnected = true;
+    status.twitchConnectionError = null;
+    console.log('[TWITCH] conectado no canal:', TWITCH_CHANNEL);
+    console.log('[MODO]', ACCEPT_ALL_MESSAGES ? 'sem comando' : 'com prefixo ' + COMMAND_PREFIX);
   }).catch(err => {
-    console.error('Erro ao conectar no chat da Twitch:', err);
+    status.twitchConnected = false;
+    status.twitchConnectionError = String(err && err.message ? err.message : err);
+    console.error('[TWITCH] erro ao conectar:', err);
+  });
+
+  client.on('connected', () => {
+    status.twitchConnected = true;
+    status.twitchConnectionError = null;
+  });
+  client.on('disconnected', (reason) => {
+    status.twitchConnected = false;
+    status.twitchConnectionError = String(reason || 'desconectado');
   });
 
   client.on('message', (channel, tags, message, self) => {
     if (self) return;
+    status.totalRaw++;
+    status.lastTwitchMessageAt = new Date().toISOString();
 
     const nick = tags['display-name'] || tags.username || 'viewer';
     const color = tags.color || '#00d5ff';
     const raw = safeText(message, 200);
-    let word = '';
+    pushLimited(rawMessages, { time: status.lastTwitchMessageAt, nick, raw, color }, 40);
+    console.log('[CHAT]', `${nick}: ${raw}`);
 
+    let word = '';
     if (ACCEPT_ALL_MESSAGES) {
-      // Ignora comandos normais do chat como !uptime, !pix, !lurk etc.
-      if (IGNORE_COMMANDS && /^[!./]/.test(raw)) return;
+      if (IGNORE_COMMANDS && /^[!./]/.test(raw)) return reject('comando ignorado', { nick, word: raw, source: 'twitch' });
       word = raw;
     } else if (raw.toLowerCase().startsWith(COMMAND_PREFIX.toLowerCase() + ' ')) {
       word = raw.slice(COMMAND_PREFIX.length).trim();
+    } else {
+      return reject('não usa prefixo', { nick, word: raw, source: 'twitch' });
     }
-
-    word = normalizeWord(word);
-    if (!isValidContextoWord(word)) return;
 
     addGuess({ nick, word, color, source: 'twitch' });
   });
 } else {
-  console.log('TWITCH_CHANNEL vazio. Usando só envio manual pelo /send.html.');
+  console.log('[AVISO] TWITCH_CHANNEL vazio. Use /send.html para teste manual.');
 }
 
-server.listen(PORT, () => console.log('Servidor online na porta', PORT));
+server.listen(PORT, () => console.log('[OK] servidor online na porta', PORT));

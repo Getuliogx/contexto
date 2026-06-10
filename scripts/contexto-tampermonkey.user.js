@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Contexto Chat Nick no Quadrinho
 // @namespace    https://chatgpt.com/
-// @version      1.0.0
+// @version      1.1.0
 // @description  Recebe palavras do Render, envia no Contexto e injeta nick colorido na linha da palavra.
 // @match        https://contexto.me/*
 // @match        https://*.contexto.me/*
@@ -64,7 +64,10 @@
     ws.onmessage = (ev) => {
       let data;
       try { data = JSON.parse(ev.data); } catch { return; }
-      if (data.type === 'hello' && Array.isArray(data.recent)) return;
+      if (data.type === 'hello' && Array.isArray(data.recent)) {
+        data.recent.forEach(receiveGuess);
+        return;
+      }
       if (data.type !== 'guess') return;
       receiveGuess(data);
     };
